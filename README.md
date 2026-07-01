@@ -1,6 +1,6 @@
 # Database Patch Management Automation using Ansible & Jenkins
 
-Production-ready database patch management framework for **MySQL**, **PostgreSQL**, and **MongoDB** using **Ansible** and **Jenkins**.
+Database patch management framework for **MySQL**, **PostgreSQL**, and **MongoDB** using **Ansible** and **Jenkins**.
 
 The framework automates the complete patch lifecycle including **Pre-check**, **Backup**, **Upgrade/Downgrade**, **Validation**, **Rollback**, and **Execution Summary** across Development, Staging, and Production environments.
 
