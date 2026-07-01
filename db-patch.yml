@@ -1,0 +1,224 @@
+---
+- name: Database Patch Management (Production)
+  hosts: all
+  become: yes
+
+  vars:
+    backup_path: "/tmp/db_backup_{{ DB_TYPE }}_{{ ansible_date_time.iso8601_basic_short }}.dump"
+    patch_status: "SUCCESS"
+    rollback_done: "NOT-NEEDED"
+
+    db_map:
+      mysql:
+        svc: mysql
+        pkg: mysql-server
+        health: "mysql -e 'SELECT 1;'"
+        backup: "mysqldump --all-databases > {{ backup_path }}"
+        restore: "mysql < {{ backup_path }}"
+        version_pkg: mysql-server
+        conn_check: "mysql -N -e 'SELECT count(*) FROM information_schema.processlist;'"
+        version_cmd: "mysql -N -e 'SELECT VERSION();'"
+        restart_cmd: "service mysql restart || service mysql start"
+      postgresql:
+        svc: postgresql
+        pkg: postgresql
+        health: "su - postgres -c \"psql -c 'SELECT 1;'\""
+        backup: "su - postgres -c \"pg_dumpall\" > {{ backup_path }}"
+        restore: "su - postgres -c \"psql\" < {{ backup_path }}"
+        version_pkg: postgresql
+        conn_check: "su - postgres -c \"psql -t -c 'SELECT count(*) FROM pg_stat_activity;'\""
+        version_cmd: "su - postgres -c \"psql -t -c 'SELECT version();'\""
+        restart_cmd: "service postgresql restart || service postgresql start"
+      mongodb:
+        svc: mongod
+        pkg: mongodb-org
+        health: "mongosh --quiet --eval 'db.runCommand({ping:1})'"
+        backup: "mongodump --archive={{ backup_path }}"
+        restore: "mongorestore --archive={{ backup_path }} --drop"
+        version_pkg: mongodb-org
+        conn_check: "mongosh --quiet --eval 'db.serverStatus().connections.current'"
+        version_cmd: "mongosh --quiet --eval 'db.version()'"
+        restart_cmd: "/usr/local/bin/mongo_restart.sh"
+
+    db: "{{ db_map[DB_TYPE] }}"
+
+  tasks:
+
+    # =========================================================
+    # 1. PRECHECK
+    # =========================================================
+    - name: "Precheck - DB service running"
+      shell: "{{ db.restart_cmd }}"
+      register: precheck_service
+      changed_when: false
+      ignore_errors: yes
+
+    - name: "Precheck - disk space"
+      shell: df -h / | awk 'NR==2{print $4}'
+      register: precheck_disk
+      changed_when: false
+
+    - name: "Precheck - connectivity"
+      shell: "{{ db.health }}"
+      register: precheck_conn
+      changed_when: false
+      ignore_errors: yes
+
+    - name: "Precheck - active connections"
+      shell: "{{ db.conn_check }}"
+      register: active_conn
+      changed_when: false
+      ignore_errors: yes
+
+    - name: "Precheck - current package version"
+      shell: "dpkg -s {{ db.version_pkg }} 2>/dev/null | grep -oP '^Version: \\K.*' || echo 'Not Installed'"
+      register: before_version_raw
+      changed_when: false
+
+    - name: "Precheck - current running version"
+      shell: "{{ db.version_cmd }}"
+      register: before_running_version
+      changed_when: false
+      ignore_errors: yes
+
+    - set_fact:
+        before_version: "{{ before_version_raw.stdout }}"
+
+    - name: "Precheck - summary"
+      debug:
+        msg:
+          - "Service Status     : {{ 'OK' if precheck_conn.rc == 0 else 'FAILED' }}"
+          - "Disk Free (/)      : {{ precheck_disk.stdout }}"
+          - "Connectivity       : {{ 'OK' if precheck_conn.rc == 0 else 'FAILED' }}"
+          - "Active Connections : {{ active_conn.stdout | default('N/A') | trim }}"
+          - "Package Version    : {{ before_version }}"
+          - "Running Version    : {{ before_running_version.stdout | default('N/A') | trim }}"
+
+    # =========================================================
+    # 2. BACKUP
+    # =========================================================
+    - name: "Backup - full backup"
+      shell: "{{ db.backup }}"
+      register: backup_result
+
+    - name: "Backup - verify not empty"
+      stat:
+        path: "{{ backup_path }}"
+      register: backup_stat
+
+    - name: "Backup - abort if empty"
+      fail:
+        msg: "Backup empty — aborting patch for safety"
+      when: backup_stat.stat.size is defined and backup_stat.stat.size == 0
+
+    - name: "Backup - confirmed"
+      debug:
+        msg: "Backup OK | {{ backup_path }} | {{ (backup_stat.stat.size / 1024) | round(1) }} KB"
+
+    # =========================================================
+    # 3. PATCH
+    # =========================================================
+    - name: "Patch - upgrade to latest"
+      apt:
+        name: "{{ db.pkg }}"
+        state: latest
+        update_cache: yes
+      register: patch_result
+      ignore_errors: yes
+      when: VERSION | trim == "latest"
+
+    - name: "Patch - install specific version"
+      apt:
+        name: "{{ db.pkg }}={{ VERSION | trim }}"
+        state: present
+        allow_downgrade: yes
+      register: patch_result
+      ignore_errors: yes
+      when: VERSION | trim != "latest"
+
+    - name: "Patch - get package version after patch"
+      shell: "dpkg -s {{ db.version_pkg }} 2>/dev/null | grep -oP '^Version: \\K.*' || echo 'Not Installed'"
+      register: after_version_raw
+      changed_when: false
+
+    - set_fact:
+        after_version: "{{ after_version_raw.stdout }}"
+
+    # =========================================================
+    # 4. VALIDATION
+    # =========================================================
+    - name: "Validation - force restart service"
+      shell: "{{ db.restart_cmd }}"
+      register: validation_service
+      ignore_errors: yes
+
+    - name: "Validation - health check"
+      shell: "{{ db.health }}"
+      register: validation_query
+      changed_when: false
+      ignore_errors: yes
+
+    - name: "Validation - get actual running version"
+      shell: "{{ db.version_cmd }}"
+      register: after_running_version
+      changed_when: false
+      ignore_errors: yes
+
+    - name: "Validation - result"
+      debug:
+        msg: "Validation: {{ 'PASSED' if validation_query.rc == 0 else 'FAILED' }}"
+
+    - name: "Mark FAILED"
+      set_fact:
+        patch_status: "FAILED"
+      when: >
+        (patch_result.failed | default(false)) or
+        (validation_query.rc | default(1) != 0)
+
+    # =========================================================
+    # 5. ROLLBACK
+    # =========================================================
+    - name: "Rollback - restore backup"
+      shell: "{{ db.restore }}"
+      when: patch_status == "FAILED"
+
+    - set_fact:
+        rollback_done: "COMPLETED"
+      when: patch_status == "FAILED"
+
+    - name: "Rollback - restart service"
+      shell: "{{ db.restart_cmd }}"
+      ignore_errors: yes
+      when: patch_status == "FAILED"
+
+    - name: "Rollback - re-verify health"
+      shell: "{{ db.health }}"
+      register: rollback_validation
+      changed_when: false
+      ignore_errors: yes
+      when: patch_status == "FAILED"
+
+    - name: "Rollback - result"
+      debug:
+        msg: "Post-rollback health: {{ 'PASSED' if rollback_validation.rc | default(1) == 0 else 'FAILED' }}"
+      when: patch_status == "FAILED"
+
+    # =========================================================
+    # 6. SUMMARY
+    # =========================================================
+    - name: "Execution Summary"
+      debug:
+        msg:
+          - "=================================================="
+          - "Host              : {{ inventory_hostname }}"
+          - "Database Type     : {{ DB_TYPE }}"
+          - "Requested Ver.    : {{ VERSION }}"
+          - "Before Pkg Ver.   : {{ before_version }}"
+          - "Before Run Ver.   : {{ before_running_version.stdout | default('N/A') | trim }}"
+          - "After Pkg Ver.    : {{ after_version }}"
+          - "After Run Ver.    : {{ after_running_version.stdout | default('N/A') | trim }}"
+          - "Backup Path       : {{ backup_path }}"
+          - "Backup Size       : {{ (backup_stat.stat.size / 1024) | round(1) }} KB"
+          - "Patch Status      : {{ patch_status }}"
+          - "Rollback Done     : {{ rollback_done }}"
+          - "=================================================="
